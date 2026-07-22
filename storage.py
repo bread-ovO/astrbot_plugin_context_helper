@@ -59,26 +59,37 @@ class MessageStore:
         sender_name: str,
         content: str,
         created_at_ms: int,
-    ) -> None:
+    ) -> bool:
+        return bool(
+            self.add_messages(
+                [
+                    (
+                        origin,
+                        platform,
+                        group_id,
+                        message_id,
+                        sender_id,
+                        sender_name,
+                        content,
+                        created_at_ms,
+                    )
+                ]
+            )
+        )
+
+    def add_messages(self, rows: list[tuple]) -> int:
         with self._connect() as connection:
-            connection.execute(
+            before = connection.total_changes
+            connection.executemany(
                 """
                 INSERT OR IGNORE INTO group_messages
                     (origin, platform, group_id, message_id, sender_id,
                      sender_name, content, created_at_ms)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    origin,
-                    platform,
-                    group_id,
-                    message_id,
-                    sender_id,
-                    sender_name,
-                    content,
-                    created_at_ms,
-                ),
+                rows,
             )
+            return connection.total_changes - before
 
     def query(self, origin: str, start_ms: int, end_ms: int, limit: int) -> list[StoredMessage]:
         with self._connect() as connection:
@@ -104,4 +115,3 @@ class MessageStore:
                 "DELETE FROM group_messages WHERE created_at_ms < ?", (cutoff_ms,)
             )
             return cursor.rowcount
-

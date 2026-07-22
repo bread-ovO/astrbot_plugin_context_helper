@@ -21,6 +21,16 @@
     "type": "int",
     "default": 30000
   },
+  "history_max_messages": {
+    "description": "单次历史补录允许拉取的最大消息数",
+    "type": "int",
+    "default": 1000
+  },
+  "history_page_size": {
+    "description": "NapCat 历史消息每页拉取数量",
+    "type": "int",
+    "default": 100
+  },
   "knowledge_prompt": {
     "description": "知识库提炼规则",
     "type": "text",

@@ -137,6 +137,146 @@ class ContextHelperPlugin(Star):
             return
         yield event.plain_result(self._to_qq_plain_text(response.completion_text))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("补录历史")
+    async def import_history(self, event: AstrMessageEvent):
+        """从 NapCat 补录群历史。用法：/补录历史 500 或 /补录历史 3天"""
+        if event.get_platform_name() != "aiocqhttp":
+            yield event.plain_result("历史补录目前仅支持 NapCat/OneBot。")
+            return
+        group_id = str(event.get_group_id() or "")
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊。")
+            return
+        if not self._allowed_group(group_id):
+            yield event.plain_result("当前群未启用上下文记录。")
+            return
+
+        command_text = (event.message_str or "").strip()
+        parts = command_text.split(maxsplit=1)
+        argument = parts[1].strip() if len(parts) == 2 else "500"
+        maximum = max(1, min(int(self.config.get("history_max_messages", 1000)), 5000))
+        period = None
+        if argument.isdigit():
+            requested = max(1, min(int(argument), maximum))
+        else:
+            requested = maximum
+            try:
+                period = parse_time_range(
+                    argument, str(self.config.get("timezone", "Asia/Shanghai"))
+                )
+            except (ValueError, KeyError) as exc:
+                yield event.plain_result(str(exc))
+                return
+
+        try:
+            history = await self._fetch_napcat_history(event, group_id, requested, period)
+        except Exception:
+            logger.exception("NapCat 群历史补录失败")
+            yield event.plain_result("历史补录失败，请检查 NapCat 连接和 AstrBot 日志。")
+            return
+
+        rows = []
+        for item in history:
+            content = self._history_text(item)
+            if not content:
+                continue
+            sender = item.get("sender") or {}
+            timestamp = int(item.get("time") or 0)
+            if timestamp <= 0:
+                continue
+            timestamp_ms = timestamp if timestamp >= 1_000_000_000_000 else timestamp * 1000
+            if period and not (period.start_ms <= timestamp_ms < period.end_ms):
+                continue
+            sender_id = str(item.get("user_id") or sender.get("user_id") or "")
+            sender_name = str(sender.get("card") or sender.get("nickname") or sender_id)
+            rows.append(
+                (
+                    event.unified_msg_origin,
+                    "aiocqhttp",
+                    group_id,
+                    str(item.get("message_id") or ""),
+                    sender_id,
+                    sender_name,
+                    content,
+                    timestamp_ms,
+                )
+            )
+
+        inserted = await asyncio.to_thread(self.store.add_messages, rows)
+        yield event.plain_result(
+            f"历史补录完成：拉取 {len(history)} 条，符合条件 {len(rows)} 条，新增 {inserted} 条。"
+        )
+
+    async def _fetch_napcat_history(self, event, group_id: str, limit: int, period):
+        page_size = max(20, min(int(self.config.get("history_page_size", 100)), 200))
+        client = getattr(event, "bot", None)
+        if client is None or not hasattr(client, "api"):
+            raise RuntimeError("当前事件没有 OneBot 客户端")
+
+        collected = []
+        seen_ids = set()
+        cursor = 0
+        while len(collected) < limit:
+            count = min(page_size, limit - len(collected))
+            payload = {"group_id": int(group_id), "count": count}
+            if cursor:
+                payload["message_seq"] = cursor
+            response = await client.api.call_action("get_group_msg_history", **payload)
+            data = response.get("data", response) if isinstance(response, dict) else response
+            messages = data.get("messages", []) if isinstance(data, dict) else []
+            if not messages:
+                break
+
+            new_count = 0
+            oldest_ms = None
+            sequences = []
+            for item in messages:
+                message_id = str(item.get("message_id") or "")
+                dedupe_key = message_id or (
+                    str(item.get("time")),
+                    str(item.get("user_id")),
+                    str(item.get("raw_message")),
+                )
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+                collected.append(item)
+                new_count += 1
+                timestamp = int(item.get("time") or 0)
+                timestamp_ms = timestamp if timestamp >= 1_000_000_000_000 else timestamp * 1000
+                oldest_ms = timestamp_ms if oldest_ms is None else min(oldest_ms, timestamp_ms)
+                sequence = item.get("message_seq") or item.get("real_id")
+                if sequence is not None:
+                    sequences.append(int(sequence))
+
+            if new_count == 0 or len(messages) < count:
+                break
+            if period and oldest_ms is not None and oldest_ms < period.start_ms:
+                break
+            if not sequences:
+                break
+            next_cursor = min(sequences)
+            if next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+        return collected[:limit]
+
+    @staticmethod
+    def _history_text(item: dict) -> str:
+        raw = item.get("raw_message")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        segments = item.get("message") or []
+        parts = []
+        for segment in segments if isinstance(segments, list) else []:
+            if segment.get("type") == "text":
+                text = (segment.get("data") or {}).get("text", "")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts).strip()
+
     @staticmethod
     def _to_qq_plain_text(text: str) -> str:
         """清理常见 Markdown，让结果适合 QQ 纯文本消息。"""
