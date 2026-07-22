@@ -21,7 +21,7 @@ PLUGIN_NAME = "astrbot_plugin_context_helper"
 
 @register(
     PLUGIN_NAME,
-    "yinchangyu",
+    "bread-ovO",
     "按时段提炼群聊中的知识库素材",
     "0.1.0",
 )
