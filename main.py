@@ -24,7 +24,7 @@ PLUGIN_NAME = "astrbot_plugin_context_helper"
     PLUGIN_NAME,
     "bread-ovO",
     "筛选群消息并按主题聚合知识库素材",
-    "0.4.0",
+    "0.4.1",
 )
 class ContextHelperPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

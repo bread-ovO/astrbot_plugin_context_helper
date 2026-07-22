@@ -161,17 +161,18 @@ class PostgresMessageStore:
         if not rows:
             return 0
         with self.pool.connection() as connection:
-            cursor = connection.executemany(
-                """
-                INSERT INTO group_messages
-                    (origin, platform, group_id, message_id, sender_id,
-                     sender_name, content, created_at_ms)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                rows,
-            )
-            return max(cursor.rowcount, 0)
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO group_messages
+                        (origin, platform, group_id, message_id, sender_id,
+                         sender_name, content, created_at_ms)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    rows,
+                )
+                return max(cursor.rowcount, 0)
 
     def query(self, origin: str, start_ms: int, end_ms: int, limit: int) -> list[StoredMessage]:
         with self.pool.connection() as connection:
@@ -237,17 +238,18 @@ class PostgresMessageStore:
         if not rows:
             return 0
         with self.pool.connection() as connection:
-            cursor = connection.executemany(
-                """
-                INSERT INTO knowledge_entries
-                    (group_origin, title, content, category, keywords_json,
-                     sources_json, confidence, content_hash, status, created_at_ms)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, 'pending', %s)
-                ON CONFLICT (group_origin, content_hash) DO NOTHING
-                """,
-                rows,
-            )
-            return max(cursor.rowcount, 0)
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO knowledge_entries
+                        (group_origin, title, content, category, keywords_json,
+                         sources_json, confidence, content_hash, status, created_at_ms)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, 'pending', %s)
+                    ON CONFLICT (group_origin, content_hash) DO NOTHING
+                    """,
+                    rows,
+                )
+                return max(cursor.rowcount, 0)
 
     def list_knowledge(self, origin: str, status: str, limit: int = 10) -> list[dict]:
         with self.pool.connection() as connection:
