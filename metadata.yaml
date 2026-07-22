@@ -1,8 +1,8 @@
 name: astrbot_plugin_context_helper
 display_name: 群聊上下文助手
-desc: 记录群聊消息，并按指定时段调用模型生成上下文摘要。
-short_desc: 按时段提炼可写入知识库的群聊内容。
-version: v0.2.0
+desc: 筛选群聊中的知识消息，按主题聚合并生成可审核的知识条目。
+short_desc: 小模型分类群消息并聚合知识主题。
+version: v0.3.0
 author: bread-ovO
 repo: https://github.com/bread-ovO/astrbot_plugin_context_helper
 astrbot_version: ">=4.9.2,<5"

@@ -13,7 +13,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from .knowledge_models import ExtractionResult
+from .knowledge_models import ClassificationResult, ExtractionResult
 from .storage import MessageStore, StoredMessage
 from .time_range import parse_time_range
 
@@ -24,8 +24,8 @@ PLUGIN_NAME = "astrbot_plugin_context_helper"
 @register(
     PLUGIN_NAME,
     "bread-ovO",
-    "按时段提炼群聊中的知识库素材",
-    "0.2.0",
+    "筛选群消息并按主题聚合知识库素材",
+    "0.3.0",
 )
 class ContextHelperPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -138,6 +138,219 @@ class ContextHelperPlugin(Star):
             yield event.plain_result("总结模型调用失败，请检查插件模型配置和 AstrBot 日志。")
             return
         yield event.plain_result(self._to_qq_plain_text(response.completion_text))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("分类消息")
+    async def classify_messages(self, event: AstrMessageEvent):
+        """用小模型筛选消息并归入知识主题。用法：/分类消息 2小时"""
+        group_id = str(event.get_group_id() or "")
+        if not group_id or not self._allowed_group(group_id):
+            yield event.plain_result("该指令仅支持已启用记录的群聊。")
+            return
+        parts = (event.message_str or "").strip().split(maxsplit=1)
+        expression = parts[1].strip() if len(parts) == 2 else str(
+            self.config.get("default_range", "2小时")
+        )
+        timezone = str(self.config.get("timezone", "Asia/Shanghai"))
+        try:
+            period = parse_time_range(expression, timezone)
+        except (ValueError, KeyError) as exc:
+            yield event.plain_result(str(exc))
+            return
+
+        batch_size = max(
+            10, min(int(self.config.get("classification_batch_size", 80)), 200)
+        )
+        messages = await asyncio.to_thread(
+            self.store.query_unclassified,
+            event.unified_msg_origin,
+            period.start_ms,
+            period.end_ms,
+            batch_size,
+        )
+        if not messages:
+            yield event.plain_result("该时段没有待分类消息。")
+            return
+        topics = await asyncio.to_thread(
+            self.store.list_topics, event.unified_msg_origin, 30
+        )
+        provider_id = str(self.config.get("classifier_provider_id", "")).strip()
+        if not provider_id:
+            provider_id = str(self.config.get("summary_provider_id", "")).strip()
+        if not provider_id:
+            provider_id = await self.context.get_current_chat_provider_id(
+                umo=event.unified_msg_origin
+            )
+
+        prompt = self._classification_prompt(messages, topics, timezone)
+        try:
+            result = await self._generate_classifications(provider_id, prompt)
+            expected_ids = {message.message_id for message in messages}
+            result_ids = {decision.message_id for decision in result.decisions}
+            if result_ids != expected_ids or len(result.decisions) != len(expected_ids):
+                missing = sorted(expected_ids - result_ids)
+                extra = sorted(result_ids - expected_ids)
+                raise ValueError(f"分类结果消息集合不一致，缺少={missing}，多出={extra}")
+            decisions = [
+                {
+                    "message_id": item.message_id,
+                    "decision": item.decision,
+                    "topic_key": item.topic_key,
+                    "topic_title": item.topic_title,
+                    "reason": item.reason,
+                    "confidence": item.confidence,
+                }
+                for item in result.decisions
+            ]
+            stats = await asyncio.to_thread(
+                self.store.save_classifications,
+                event.unified_msg_origin,
+                decisions,
+                max(2, int(self.config.get("topic_ready_messages", 5))),
+                int(time.time() * 1000),
+            )
+        except Exception:
+            logger.exception("消息分类失败")
+            yield event.plain_result("消息分类失败，模型输出未通过校验。详情见 AstrBot 日志。")
+            return
+
+        yield event.plain_result(
+            f"分类完成：处理 {len(messages)} 条，保留 {stats['kept']} 条，"
+            f"过滤 {stats['discarded']} 条，涉及 {stats['topics']} 个知识主题。"
+        )
+
+    def _classification_prompt(
+        self, messages: list[StoredMessage], topics: list[dict], timezone: str
+    ) -> str:
+        existing = (
+            "\n".join(
+                f"- {topic['topic_key']}：{topic['title']}" for topic in topics
+            )
+            or "无"
+        )
+        transcript = self._format_transcript(messages, timezone)
+        rules = str(self.config.get("knowledge_prompt", "")).strip()
+        return (
+            "你是群聊知识消息分类器。逐条判断消息是否能为长期知识库提供事实、方法、"
+            "参数、问题解决过程、项目决策或重要资源。闲聊、情绪、玩笑、重复、孤立且"
+            "无法验证的信息归为 discard。\n"
+            f"筛选规则：{rules}\n\n"
+            "保留消息应归入一个知识主题。优先复用现有 topic_key；新主题使用稳定、简短的"
+            "小写英文 topic_key。每条输入必须输出一条决定。\n"
+            "只输出合法 JSON 对象：\n"
+            '{"decisions":[{"message_id":"...","decision":"keep|discard",'
+            '"topic_key":"...","topic_title":"...","reason":"...","confidence":0.0}]}\n'
+            "discard 项的 topic_key 和 topic_title 使用空字符串。\n\n"
+            f"现有主题：\n{existing}\n\n待分类消息：\n{transcript}"
+        )
+
+    async def _generate_classifications(
+        self, provider_id, prompt: str
+    ) -> ClassificationResult:
+        response = await self.context.llm_generate(
+            chat_provider_id=provider_id, prompt=prompt
+        )
+        try:
+            return self._parse_classifications(response.completion_text)
+        except (ValueError, json.JSONDecodeError) as first_error:
+            repaired = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=(
+                    "修复下面的分类结果。只输出合法 JSON，每条输入消息保留一条决定。\n"
+                    '{"decisions":[{"message_id":"...","decision":"keep|discard",'
+                    '"topic_key":"...","topic_title":"...","reason":"...","confidence":0.0}]}\n'
+                    f"校验错误：{first_error}\n原始输出：\n{response.completion_text}"
+                ),
+            )
+            return self._parse_classifications(repaired.completion_text)
+
+    @staticmethod
+    def _parse_classifications(text: str) -> ClassificationResult:
+        cleaned = text.strip().replace("```json", "").replace("```", "").strip()
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("模型输出中没有 JSON 对象")
+        return ClassificationResult.model_validate(json.loads(cleaned[start : end + 1]))
+
+    @filter.command("知识主题")
+    async def list_knowledge_topics(self, event: AstrMessageEvent):
+        """查看当前群的知识主题。"""
+        topics = await asyncio.to_thread(
+            self.store.list_topics, event.unified_msg_origin, 20
+        )
+        if not topics:
+            yield event.plain_result("当前没有知识主题。先执行 /分类消息 2小时。")
+            return
+        status_names = {"collecting": "收集中", "ready": "可总结", "summarized": "已总结"}
+        lines = ["【知识主题】"]
+        for topic in topics:
+            status = status_names.get(topic["status"], topic["status"])
+            lines.append(
+                f"#{topic['id']} {topic['title']}｜{topic['message_count']} 条｜{status}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("总结主题")
+    async def summarize_topic(self, event: AstrMessageEvent):
+        """将一个知识主题总结成候选知识。用法：/总结主题 12"""
+        argument = self._command_argument(event)
+        if not argument.isdigit():
+            yield event.plain_result("用法：/总结主题 主题编号")
+            return
+        topic_id = int(argument)
+        topic = await asyncio.to_thread(
+            self.store.get_topic, event.unified_msg_origin, topic_id
+        )
+        if not topic:
+            yield event.plain_result("没有找到该知识主题。")
+            return
+        messages = await asyncio.to_thread(
+            self.store.get_topic_messages, event.unified_msg_origin, topic_id
+        )
+        if not messages:
+            yield event.plain_result("该主题没有关联消息。")
+            return
+        provider_id = str(self.config.get("summary_provider_id", "")).strip()
+        if not provider_id:
+            provider_id = await self.context.get_current_chat_provider_id(
+                umo=event.unified_msg_origin
+            )
+        timezone = str(self.config.get("timezone", "Asia/Shanghai"))
+        transcript = self._format_transcript(messages, timezone)
+        prompt = (
+            f"将知识主题“{topic['title']}”总结成一个自包含、可长期复用的知识条目。"
+            "消除重复和无关内容，保留事实、条件、步骤、参数、结论及不确定性。"
+            "只输出合法 JSON：\n"
+            '{"entries":[{"title":"...","content":"...","category":"开发文档|故障处理|项目决策|资源|待验证",'
+            '"keywords":["..."],"source_message_ids":["..."],"confidence":0.0}]}\n'
+            "必须只输出一条知识，来源 ID 必须来自下面的 msg_id。\n\n"
+            + transcript
+        )
+        try:
+            result = await self._generate_structured(provider_id, prompt)
+            if len(result.entries) != 1:
+                raise ValueError("主题总结必须返回一条知识")
+            now_ms = int(time.time() * 1000)
+            rows = self._knowledge_rows(
+                event.unified_msg_origin, result, messages, timezone, now_ms
+            )
+            if not rows:
+                raise ValueError("主题总结没有有效来源")
+            inserted = await asyncio.to_thread(self.store.add_knowledge_entries, rows)
+            await asyncio.to_thread(
+                self.store.mark_topic_summarized,
+                event.unified_msg_origin,
+                topic_id,
+                now_ms,
+            )
+        except Exception:
+            logger.exception("知识主题总结失败")
+            yield event.plain_result("主题总结失败，模型输出未通过校验。详情见 AstrBot 日志。")
+            return
+        yield event.plain_result(
+            f"主题总结完成，新增候选知识 {inserted} 条。使用 /候选知识 查看。"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("提炼知识")

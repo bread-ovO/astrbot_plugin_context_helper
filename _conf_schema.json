@@ -6,6 +6,23 @@
     "_special": "select_provider",
     "hint": "选择 DeepSeek V4 Flash；留空时使用当前会话模型"
   },
+  "classifier_provider_id": {
+    "description": "用于筛选消息和归类主题的小模型提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "建议选择便宜、响应快的小模型；留空时使用总结模型"
+  },
+  "classification_batch_size": {
+    "description": "每次提交给分类模型的消息数",
+    "type": "int",
+    "default": 80
+  },
+  "topic_ready_messages": {
+    "description": "主题累计多少条有效消息后标记为可总结",
+    "type": "int",
+    "default": 5
+  },
   "default_range": {
     "description": "未指定时段时默认回溯多久",
     "type": "string",

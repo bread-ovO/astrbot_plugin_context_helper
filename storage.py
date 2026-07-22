@@ -80,6 +80,44 @@ class MessageStore:
                     ON knowledge_entries(group_origin, content_hash);
                 CREATE INDEX IF NOT EXISTS idx_knowledge_status
                     ON knowledge_entries(group_origin, status, created_at_ms);
+
+                CREATE TABLE IF NOT EXISTS knowledge_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_origin TEXT NOT NULL,
+                    topic_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'collecting',
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    first_message_at_ms INTEGER,
+                    last_message_at_ms INTEGER,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE (group_origin, topic_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_topics_origin_status
+                    ON knowledge_topics(group_origin, status, updated_at_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS message_classifications (
+                    group_origin TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    topic_id INTEGER,
+                    reason TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL,
+                    classified_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (group_origin, message_id),
+                    FOREIGN KEY (topic_id) REFERENCES knowledge_topics(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_messages (
+                    topic_id INTEGER NOT NULL,
+                    group_origin TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    added_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (topic_id, message_id),
+                    UNIQUE (group_origin, message_id),
+                    FOREIGN KEY (topic_id) REFERENCES knowledge_topics(id)
+                );
                 """
             )
 
@@ -164,6 +202,182 @@ class MessageStore:
                 (origin, start_ms, end_ms, message_count, provider_id, created_at_ms),
             )
             return int(cursor.lastrowid)
+
+    def query_unclassified(
+        self, origin: str, start_ms: int, end_ms: int, limit: int
+    ) -> list[StoredMessage]:
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT gm.message_id, gm.sender_name, gm.sender_id,
+                       gm.content, gm.created_at_ms
+                FROM group_messages gm
+                LEFT JOIN message_classifications mc
+                  ON mc.group_origin = gm.origin AND mc.message_id = gm.message_id
+                WHERE gm.origin = ?
+                  AND gm.created_at_ms >= ? AND gm.created_at_ms < ?
+                  AND gm.message_id IS NOT NULL AND gm.message_id != ''
+                  AND mc.message_id IS NULL
+                ORDER BY gm.created_at_ms ASC, gm.id ASC
+                LIMIT ?
+                """,
+                (origin, start_ms, end_ms, limit),
+            ).fetchall()
+        return [StoredMessage(*row) for row in rows]
+
+    def list_topics(self, origin: str, limit: int = 30) -> list[dict]:
+        with closing(self._connect()) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM knowledge_topics
+                WHERE group_origin = ?
+                ORDER BY updated_at_ms DESC
+                LIMIT ?
+                """,
+                (origin, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_classifications(
+        self,
+        origin: str,
+        decisions: list[dict],
+        ready_threshold: int,
+        classified_at_ms: int,
+    ) -> dict:
+        kept = discarded = 0
+        touched_topics: set[int] = set()
+        with closing(self._connect()) as connection, connection:
+            for decision in decisions:
+                message_id = decision["message_id"]
+                if decision["decision"] == "discard":
+                    cursor = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO message_classifications
+                            (group_origin, message_id, decision, reason,
+                             confidence, classified_at_ms)
+                        VALUES (?, ?, 'discard', ?, ?, ?)
+                        """,
+                        (
+                            origin,
+                            message_id,
+                            decision["reason"],
+                            decision["confidence"],
+                            classified_at_ms,
+                        ),
+                    )
+                    discarded += cursor.rowcount
+                    continue
+
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_topics
+                        (group_origin, topic_key, title, status, created_at_ms, updated_at_ms)
+                    VALUES (?, ?, ?, 'collecting', ?, ?)
+                    ON CONFLICT(group_origin, topic_key) DO UPDATE SET
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        origin,
+                        decision["topic_key"],
+                        decision["topic_title"],
+                        classified_at_ms,
+                        classified_at_ms,
+                    ),
+                )
+                topic_id = int(
+                    connection.execute(
+                        "SELECT id FROM knowledge_topics WHERE group_origin = ? AND topic_key = ?",
+                        (origin, decision["topic_key"]),
+                    ).fetchone()[0]
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO message_classifications
+                        (group_origin, message_id, decision, topic_id, reason,
+                         confidence, classified_at_ms)
+                    VALUES (?, ?, 'keep', ?, ?, ?, ?)
+                    """,
+                    (
+                        origin,
+                        message_id,
+                        topic_id,
+                        decision["reason"],
+                        decision["confidence"],
+                        classified_at_ms,
+                    ),
+                )
+                if cursor.rowcount:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO topic_messages
+                            (topic_id, group_origin, message_id, added_at_ms)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (topic_id, origin, message_id, classified_at_ms),
+                    )
+                    kept += 1
+                    touched_topics.add(topic_id)
+
+            for topic_id in touched_topics:
+                stats = connection.execute(
+                    """
+                    SELECT COUNT(*), MIN(gm.created_at_ms), MAX(gm.created_at_ms)
+                    FROM topic_messages tm
+                    JOIN group_messages gm
+                      ON gm.origin = tm.group_origin AND gm.message_id = tm.message_id
+                    WHERE tm.topic_id = ?
+                    """,
+                    (topic_id,),
+                ).fetchone()
+                status = "ready" if stats[0] >= ready_threshold else "collecting"
+                connection.execute(
+                    """
+                    UPDATE knowledge_topics
+                    SET message_count = ?, first_message_at_ms = ?, last_message_at_ms = ?,
+                        status = CASE WHEN status = 'summarized' THEN status ELSE ? END,
+                        updated_at_ms = ?
+                    WHERE id = ?
+                    """,
+                    (stats[0], stats[1], stats[2], status, classified_at_ms, topic_id),
+                )
+        return {"kept": kept, "discarded": discarded, "topics": len(touched_topics)}
+
+    def get_topic(self, origin: str, topic_id: int) -> dict | None:
+        with closing(self._connect()) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM knowledge_topics WHERE group_origin = ? AND id = ?",
+                (origin, topic_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_topic_messages(self, origin: str, topic_id: int) -> list[StoredMessage]:
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT gm.message_id, gm.sender_name, gm.sender_id,
+                       gm.content, gm.created_at_ms
+                FROM topic_messages tm
+                JOIN group_messages gm
+                  ON gm.origin = tm.group_origin AND gm.message_id = tm.message_id
+                WHERE tm.group_origin = ? AND tm.topic_id = ?
+                ORDER BY gm.created_at_ms ASC, gm.id ASC
+                """,
+                (origin, topic_id),
+            ).fetchall()
+        return [StoredMessage(*row) for row in rows]
+
+    def mark_topic_summarized(self, origin: str, topic_id: int, updated_at_ms: int) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE knowledge_topics SET status = 'summarized', updated_at_ms = ?
+                WHERE group_origin = ? AND id = ?
+                """,
+                (updated_at_ms, origin, topic_id),
+            )
 
     def finish_job(self, job_id: int, status: str, error: str | None = None) -> None:
         with closing(self._connect()) as connection, connection:
