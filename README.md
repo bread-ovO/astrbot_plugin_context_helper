@@ -4,6 +4,8 @@
 
 项目基于 AstrBot 官方 `Soulter/helloworld` 插件模板开发，要求 AstrBot `>=4.9.2,<5`。
 
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 功能
 
 - 自动保存允许群聊中的纯文本消息
