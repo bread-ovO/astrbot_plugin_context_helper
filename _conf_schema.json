@@ -1,0 +1,44 @@
+{
+  "summary_provider_id": {
+    "description": "用于总结群聊记录的模型提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "选择 DeepSeek V4 Flash；留空时使用当前会话模型"
+  },
+  "default_range": {
+    "description": "未指定时段时默认回溯多久",
+    "type": "string",
+    "default": "2小时"
+  },
+  "max_messages": {
+    "description": "单次总结最多读取的消息数",
+    "type": "int",
+    "default": 500
+  },
+  "max_chars": {
+    "description": "单次提交给总结模型的最大字符数",
+    "type": "int",
+    "default": 30000
+  },
+  "knowledge_prompt": {
+    "description": "知识库提炼规则",
+    "type": "text",
+    "default": "只保留适合长期知识库的内容：明确结论、操作方法、配置参数、故障原因与解决方案、项目决策及其理由、重要资源线索。过滤寒暄、玩笑、情绪表达、无结论争论、重复信息、临时状态、身份隐私和缺乏依据的猜测。每条知识必须脱离原聊天仍可理解；信息不足时标为待验证，禁止补写记录中没有的事实。"
+  },
+  "retention_days": {
+    "description": "消息保留天数，0 表示永久保留",
+    "type": "int",
+    "default": 90
+  },
+  "timezone": {
+    "description": "解析和展示时段使用的时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "group_allowlist": {
+    "description": "允许记录的群 ID；空列表表示全部群",
+    "type": "list",
+    "default": []
+  }
+}
