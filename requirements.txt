@@ -1,1 +1,1 @@
-# 仅使用 Python 标准库和 AstrBot 提供的 API。
+psycopg[binary,pool]>=3.2,<4

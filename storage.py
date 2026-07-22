@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass(frozen=True)
-class StoredMessage:
-    message_id: str
-    sender_name: str
-    sender_id: str
-    content: str
-    created_at_ms: int
-
+try:
+    from .message_models import StoredMessage
+except ImportError:  # 允许独立运行旧数据迁移和测试
+    from message_models import StoredMessage
 
 class MessageStore:
     def __init__(self, database_path: Path):

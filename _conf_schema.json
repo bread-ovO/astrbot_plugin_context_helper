@@ -1,4 +1,21 @@
 {
+  "database_url": {
+    "description": "PostgreSQL 连接地址",
+    "type": "string",
+    "default": "postgresql://astrbot:astrbot@postgres:5432/astrbot_context",
+    "hint": "格式：postgresql://用户名:密码@主机:端口/数据库",
+    "obvious_hint": true
+  },
+  "database_pool_min_size": {
+    "description": "PostgreSQL 最小连接池大小",
+    "type": "int",
+    "default": 2
+  },
+  "database_pool_max_size": {
+    "description": "PostgreSQL 最大连接池大小",
+    "type": "int",
+    "default": 10
+  },
   "summary_provider_id": {
     "description": "用于总结群聊记录的模型提供商",
     "type": "string",

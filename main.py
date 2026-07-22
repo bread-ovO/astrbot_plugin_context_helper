@@ -6,15 +6,14 @@ import json
 import re
 import time
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .knowledge_models import ClassificationResult, ExtractionResult
-from .storage import MessageStore, StoredMessage
+from .message_models import StoredMessage
+from .postgres_storage import PostgresMessageStore
 from .time_range import parse_time_range
 
 
@@ -25,19 +24,28 @@ PLUGIN_NAME = "astrbot_plugin_context_helper"
     PLUGIN_NAME,
     "bread-ovO",
     "筛选群消息并按主题聚合知识库素材",
-    "0.3.0",
+    "0.4.0",
 )
 class ContextHelperPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
-        self.store = MessageStore(data_dir / "messages.sqlite3")
+        database_url = str(config.get("database_url", "")).strip()
+        pool_min_size = max(1, int(config.get("database_pool_min_size", 2)))
+        pool_max_size = max(pool_min_size, int(config.get("database_pool_max_size", 10)))
+        self.store = PostgresMessageStore(
+            database_url=database_url,
+            min_size=pool_min_size,
+            max_size=pool_max_size,
+        )
         self._last_purge_ms = 0
 
     async def initialize(self):
         """插件加载后由 AstrBot 调用。"""
-        logger.info("群聊上下文助手已加载，SQLite 数据库：%s", self.store.database_path)
+        if not self.store.database_url:
+            raise RuntimeError("请先在插件配置中填写 PostgreSQL database_url")
+        await asyncio.to_thread(self.store.open)
+        logger.info("群聊上下文助手已连接 PostgreSQL")
 
     def _allowed_group(self, group_id: str) -> bool:
         allowlist = {str(item) for item in self.config.get("group_allowlist", [])}
@@ -289,6 +297,28 @@ class ContextHelperPlugin(Star):
                 f"#{topic['id']} {topic['title']}｜{topic['message_count']} 条｜{status}"
             )
         yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("存储状态")
+    async def storage_status(self, event: AstrMessageEvent):
+        """查看当前群的 PostgreSQL 存储状态。"""
+        try:
+            stats = await asyncio.to_thread(
+                self.store.stats, event.unified_msg_origin
+            )
+        except Exception:
+            logger.exception("读取 PostgreSQL 存储状态失败")
+            yield event.plain_result("PostgreSQL 状态读取失败。")
+            return
+        size_mb = stats["database_bytes"] / 1024 / 1024
+        yield event.plain_result(
+            "【PostgreSQL 存储状态】\n"
+            f"本群消息：{stats['messages']} 条\n"
+            f"已分类：{stats['classified']} 条\n"
+            f"知识主题：{stats['topics']} 个\n"
+            f"知识条目：{stats['knowledge']} 条\n"
+            f"数据库总大小：{size_mb:.2f} MB"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("总结主题")
@@ -603,7 +633,12 @@ class ContextHelperPlugin(Star):
             f"内容：{entry['content']}"
         )
         if detailed:
-            sources = json.loads(entry["sources_json"])
+            sources_value = entry["sources_json"]
+            sources = (
+                json.loads(sources_value)
+                if isinstance(sources_value, str)
+                else sources_value
+            )
             source_lines = [
                 f"{item['sender_name']}，{item['time']}：{item['quote']}" for item in sources
             ]
@@ -787,4 +822,5 @@ class ContextHelperPlugin(Star):
 
     async def terminate(self):
         """插件停用或卸载时由 AstrBot 调用。"""
+        await asyncio.to_thread(self.store.close)
         logger.info("群聊上下文助手已停止")
